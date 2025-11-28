@@ -2,11 +2,8 @@ from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 
 from PIL import Image
 import torch
-import torchvision.transforms as T
 import numpy as np
 
-from torchvision.transforms.functional import to_pil_image
-import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
 
@@ -29,7 +26,21 @@ warnings.filterwarnings("ignore", category=UserWarning, module="safetensors")
 
 def tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
     """Convert a tensor to a numpy array and scale its values to 0-255."""
-    array = tensor.numpy().squeeze()
+    tensor_cpu = tensor.detach().to("cpu")
+
+    if tensor_cpu.dtype != torch.float32:
+        tensor_cpu = tensor_cpu.float()
+
+    tensor_cpu = tensor_cpu.clamp(0, 1).contiguous()
+    array = tensor_cpu.numpy()
+
+    if array.ndim == 4 and array.shape[0] == 1:
+        array = array.squeeze(0)
+
+    if array.ndim == 3 and array.shape[0] in (1, 3, 4) and array.shape[-1] not in (3, 4):
+        array = np.transpose(array, (1, 2, 0))
+
+    array = np.clip(array, 0, 1)
     return (array * 255).astype(np.uint8)
 
 def numpy_to_tensor(array: np.ndarray) -> torch.Tensor:
@@ -39,7 +50,15 @@ def numpy_to_tensor(array: np.ndarray) -> torch.Tensor:
 
 def apply_colormap(mask: torch.Tensor, colormap) -> np.ndarray:
     """Apply a colormap to a tensor and convert it to a numpy array."""
-    colored_mask = colormap(mask.numpy())[:, :, :3]
+    mask_cpu = mask.detach().to("cpu")
+
+    if mask_cpu.dtype != torch.float32:
+        mask_cpu = mask_cpu.float()
+
+    mask_cpu = mask_cpu.clamp(0, 1).contiguous()
+    mask_np = mask_cpu.numpy().squeeze()
+    colored_mask = colormap(mask_np)[:, :, :3]
+    colored_mask = np.clip(colored_mask, 0, 1)
     return (colored_mask * 255).astype(np.uint8)
 
 def resize_image(image: np.ndarray, dimensions: Tuple[int, int]) -> np.ndarray:
@@ -54,7 +73,15 @@ def dilate_mask(mask: torch.Tensor, dilation_factor: float) -> torch.Tensor:
     """Dilate a mask using a square kernel with a given dilation factor."""
     kernel_size = int(dilation_factor * 2) + 1
     kernel = np.ones((kernel_size, kernel_size), np.uint8)
-    mask_dilated = cv2.dilate(mask.numpy(), kernel, iterations=1)
+    mask_cpu = mask.detach().to("cpu")
+
+    if mask_cpu.dtype != torch.float32:
+        mask_cpu = mask_cpu.float()
+
+    mask_np = mask_cpu.clamp(0, 1).contiguous().numpy()
+    mask_np = np.clip(mask_np, 0, 1).astype(np.float32, copy=False)
+    mask_dilated = cv2.dilate(mask_np, kernel, iterations=1)
+    mask_dilated = np.clip(mask_dilated, 0, 1).astype(np.float32, copy=False)
     return torch.from_numpy(mask_dilated)
 
 
@@ -171,10 +198,16 @@ class CLIPSeg:
         # Apply Gaussian blur to the thresholded tensor
         sigma = blur
         tensor_smoothed = gaussian_filter(tensor_thresholded.numpy(), sigma=sigma)
-        tensor_smoothed = torch.from_numpy(tensor_smoothed)
+        tensor_smoothed = torch.from_numpy(tensor_smoothed).float()
 
         # Normalize the smoothed tensor to [0, 1]
-        mask_normalized = (tensor_smoothed - tensor_smoothed.min()) / (tensor_smoothed.max() - tensor_smoothed.min())
+        mask_min = tensor_smoothed.min()
+        mask_max = tensor_smoothed.max()
+        range_val = mask_max - mask_min
+        if range_val > 0:
+            mask_normalized = (tensor_smoothed - mask_min) / range_val
+        else:
+            mask_normalized = torch.zeros_like(tensor_smoothed)
 
         # Dilate the normalized mask
         mask_dilated = dilate_mask(mask_normalized, dilation_factor)
