@@ -1,16 +1,7 @@
 
 matplotlib
 matplotlib-inline
-numpy
-open-clip-torch
 opencv-python
 Pillow
-pytorch-lightning
-torch
-torchaudio
-torchdiffeq
-torchmetrics
-torchsde
-torchvision
-transformers==4.45.0
+scipy
 
