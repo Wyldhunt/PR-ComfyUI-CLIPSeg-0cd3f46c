@@ -15,6 +15,9 @@ import cv2
 from scipy.ndimage import gaussian_filter
 
 from typing import Optional, Tuple
+import threading
+
+import comfy.model_management as mm
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torch")
@@ -57,9 +60,38 @@ def dilate_mask(mask: torch.Tensor, dilation_factor: float) -> torch.Tensor:
 
 
 class CLIPSeg:
+    _MODEL_ID = "CIDAS/clipseg-rd64-refined"
+    _PROCESSOR: Optional[CLIPSegProcessor] = None
+    _MODEL_CACHE: dict[str, CLIPSegForImageSegmentation] = {}
+    _CACHE_LOCK = threading.Lock()
 
     def __init__(self):
         pass
+
+    @classmethod
+    def _get_device(cls, device_selection: Optional[str]) -> torch.device:
+        if device_selection and device_selection != "default":
+            return torch.device(device_selection)
+        return mm.get_torch_device()
+
+    @classmethod
+    def _get_processor_and_model(cls, device: torch.device) -> Tuple[CLIPSegProcessor, CLIPSegForImageSegmentation]:
+        processor = cls._PROCESSOR
+        model = cls._MODEL_CACHE.get(str(device))
+
+        if processor is None or model is None:
+            with cls._CACHE_LOCK:
+                if cls._PROCESSOR is None:
+                    cls._PROCESSOR = CLIPSegProcessor.from_pretrained(cls._MODEL_ID)
+                if str(device) not in cls._MODEL_CACHE:
+                    loaded_model = CLIPSegForImageSegmentation.from_pretrained(cls._MODEL_ID)
+                    loaded_model.to(device)
+                    loaded_model.eval()
+                    cls._MODEL_CACHE[str(device)] = loaded_model
+                processor = cls._PROCESSOR
+                model = cls._MODEL_CACHE[str(device)]
+
+        return processor, model
     
     @classmethod
     def INPUT_TYPES(s):
@@ -88,6 +120,7 @@ class CLIPSeg:
                         "blur": ("FLOAT", {"min": 0, "max": 15, "step": 0.1, "default": 7}),
                         "threshold": ("FLOAT", {"min": 0, "max": 1, "step": 0.05, "default": 0.4}),
                         "dilation_factor": ("INT", {"min": 0, "max": 10, "step": 1, "default": 4}),
+                        "device": (["default", "cpu", "cuda"], {"default": "default"}),
                     }
                 }
 
@@ -96,7 +129,7 @@ class CLIPSeg:
     RETURN_NAMES = ("Mask","Heatmap Mask", "BW Mask")
 
     FUNCTION = "segment_image"
-    def segment_image(self, image: torch.Tensor, text: str, blur: float, threshold: float, dilation_factor: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def segment_image(self, image: torch.Tensor, text: str, blur: float, threshold: float, dilation_factor: int, device: str = "default") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Create a segmentation mask from an image and a text prompt using CLIPSeg.
 
         Args:
@@ -115,20 +148,21 @@ class CLIPSeg:
         # Create a PIL image from the numpy array
         i = Image.fromarray(image_np, mode="RGB")
 
-        processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
-        model = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined")
-        
+        execution_device = self._get_device(device)
+        processor, model = self._get_processor_and_model(execution_device)
+
         prompt = text
-        
+
         input_prc = processor(text=prompt, images=[i], return_tensors="pt")
-        
-        # Predict the segemntation mask
+        input_prc = {k: v.to(execution_device) if hasattr(v, "to") else v for k, v in input_prc.items()}
+
+        # Predict the segmentation mask
         with torch.no_grad():
             outputs = model(**input_prc)
-        
+
         # see https://huggingface.co/blog/clipseg-zero-shot
         preds = outputs.logits.unsqueeze(1)
-        tensor = torch.sigmoid(preds[0][0]) # get the mask
+        tensor = torch.sigmoid(preds[0][0]).cpu() # get the mask
                 
         # Apply a threshold to the original tensor to cut off low values
         thresh = threshold
